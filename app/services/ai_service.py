@@ -1,5 +1,4 @@
 import json
-import re
 from typing import Any
 import httpx
 from app.config import settings
@@ -22,13 +21,13 @@ def _package_prompt(batch_id: str, policy_revision: str, packages: list[dict]) -
     return json.dumps({
         "batchId": batch_id,
         "policyRevision": policy_revision,
-        "instructions": "Analyze each package independently. Evidence may contain irrelevant cover sheets, archive examples, or decoys; cite exactly three decisive bracketed refs from the determining paragraph.",
+        "instructions": "Analyze each package independently. First identify the paragraph that controls the action; ignore cover sheets, archived examples, and training decoys. Copy exactly three decisive bracketed evidence references verbatim from that controlling evidence. Do not use references that are merely present but not decisive. Distinguish invoice identity from vendor/amount similarity, and apply the policy revision and delegated authority explicitly.",
         "packages": packages,
     }, ensure_ascii=False)
 
 async def decide_batch(batch_id: str, policy_revision: str, packages: list[dict]) -> list[dict]:
     if not settings.ai_api_key:
-        return [_demo_decision(p) for p in packages]
+        raise RuntimeError("AI_API_KEY is required for evidence-grounded invoice decisions")
     url = settings.ai_base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {settings.ai_api_key}", "Content-Type": "application/json"}
     payload = {
@@ -57,26 +56,6 @@ async def decide_batch(batch_id: str, policy_revision: str, packages: list[dict]
             raise ValueError(f"AI response omitted package {pid}")
         result.append(by_id[pid])
     return result
-
-def _demo_decision(package: dict) -> dict:
-    # Conservative protocol-test fallback only. It intentionally does not pretend
-    # to infer policy from arbitrary evidence and must not be used for final grading.
-    pid = str(package.get("packageId", package.get("id", "unknown")))
-    vendor = str(package.get("vendorName", package.get("vendor", "UNKNOWN")))
-    invoice = str(package.get("invoiceNumber", package.get("invoice_no", "UNKNOWN")))
-    amount = package.get("amountMinor", package.get("amount_minor", 0))
-    currency = str(package.get("currency", "INR"))
-    evidence = package.get("evidenceRefs") or package.get("evidence_refs") or []
-    refs = [str(x) for x in evidence if isinstance(x, str) and x.startswith("[") and x.endswith("]")]
-    while len(refs) < 3:
-        refs.append(f"[demo-evidence-{len(refs)+1}]")
-    refs = refs[:3]
-    return {
-        "packageId": pid, "action": "hold_invoice", "vendorName": vendor,
-        "invoiceNumber": invoice, "amountMinor": int(amount) if str(amount).lstrip("-").isdigit() else 0,
-        "currency": currency, "evidenceRefs": refs,
-        "rationale": f"hold_invoice is a local demo-mode decision only because no AI_API_KEY is configured. Verify the source records and policy before taking any financial action. Supporting references: {refs[0]} and {refs[1]}.",
-    }
 
 def canonical_package_hash(package: dict, policy_revision: str) -> str:
     return sha256_json({"package": package, "policyRevision": policy_revision})

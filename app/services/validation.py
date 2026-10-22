@@ -1,4 +1,4 @@
-import re
+import json
 import secrets
 from app.schemas import ACTIONS
 from app.services.normalization import evidence_ref_is_bracketed
@@ -20,6 +20,7 @@ def validate_decisions(batch_id: str, packages: list[dict], decisions: list[dict
         raise ValueError("AI output package IDs do not match input package IDs")
 
     result = []
+    action_ids = set()
     for package in packages:
         pid = str(_field(package, "packageId", "id"))
         d = decision_map[pid]
@@ -39,6 +40,10 @@ def validate_decisions(batch_id: str, packages: list[dict], decisions: list[dict
             raise ValueError(f"Exactly three bracketed evidence references required for package {pid}")
         if len(set(refs)) != 3:
             raise ValueError(f"Evidence references must be distinct for package {pid}")
+        # Reject invented references: every citation must literally occur in this package's source data.
+        source_text = json.dumps(package, ensure_ascii=False, sort_keys=True)
+        if any(ref not in source_text for ref in refs):
+            raise ValueError(f"Evidence reference is not present in source package {pid}")
         rationale = str(d.get("rationale", "")).strip()
         if not 60 <= len(rationale) <= 1500:
             raise ValueError(f"Rationale must be 60-1500 characters for package {pid}")
@@ -47,9 +52,13 @@ def validate_decisions(batch_id: str, packages: list[dict], decisions: list[dict
         cited = sum(1 for ref in refs if ref in rationale)
         if cited < 2:
             raise ValueError(f"Rationale must cite at least two evidence references for package {pid}")
+        action_id = secrets.token_urlsafe(18)
+        while len(action_id) < 12 or action_id in action_ids:
+            action_id = secrets.token_urlsafe(18)
+        action_ids.add(action_id)
         result.append({
             "packageId": pid,
-            "actionId": secrets.token_urlsafe(18),
+            "actionId": action_id,
             "action": action,
             "facts": {"vendorName": vendor, "invoiceNumber": invoice, "amountMinor": amount, "currency": currency},
             "evidenceRefs": refs,

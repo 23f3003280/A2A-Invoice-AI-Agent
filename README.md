@@ -1,16 +1,10 @@
 # A2A Invoice Action Agent
 
-A FastAPI implementation scaffold for the A2A Invoice Agent assignment. It includes:
-- Public Agent Card at `/.well-known/agent-card.json`
-- Authenticated A2A 1.0 HTTP+JSON routes
-- Invoice batch analysis through an OpenAI-compatible AI API
-- Structured proposal validation, task history, and result continuation
-- SQLite persistence, bearer-principal isolation, idempotency, cancellation, and tests
-- Render deployment guidance
+FastAPI service for the invoice-agent assignment. It implements the custom A2A 1.0 HTTP+JSON surface, durable task records, principal-scoped access, message idempotency, package decision caching, continuation validation, receipts, and atomic cancellation/completion transitions.
 
-> Important: Treat this as a starter implementation and test it against the assignment's exact protocol/grader. The assignment's custom A2A media types and envelope requirements are implemented here, but hidden grader behavior may require small adjustments.
+**Important:** this code is designed to follow the assignment contract, but hidden grader behavior and real invoice decisions must still be verified with the provided grader. A valid AI API key is required for business decision scoring. The app deliberately does not silently substitute a blanket `hold_invoice` answer when the key is missing.
 
-## 1. Local setup
+## Local setup
 
 Python 3.11+ recommended.
 
@@ -18,79 +12,59 @@ Python 3.11+ recommended.
 python -m venv .venv
 # Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
-# macOS/Linux:
-# source .venv/bin/activate
-
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env  # Windows; on macOS/Linux use: cp .env.example .env
+cp .env.example .env  # Windows: copy .env.example .env
 ```
 
-Edit `.env`. Add your AI API key if you want live AI decisions. The app can run without a key for local protocol testing, using a clearly marked conservative demo decision path; do not rely on demo mode for submission.
-
-Start:
+Set `AI_API_KEY` in `.env` for real decisions. Do not commit `.env`. Start the service:
 
 ```bash
 uvicorn app.main:app --reload
 ```
 
-Agent Card: <http://127.0.0.1:8000/.well-known/agent-card.json>
+- Agent Card: `http://127.0.0.1:8000/.well-known/agent-card.json`
+- Health: `http://127.0.0.1:8000/health`
+- FastAPI docs: `http://127.0.0.1:8000/docs`
 
-## 2. Environment variables
+## Render deployment
 
-- `AI_API_KEY`: secret AI provider key; configure it in Render's Environment page, not GitHub.
-- `AI_BASE_URL`: OpenAI-compatible API root, e.g. `https://api.openai.com/v1`.
-- `AI_MODEL`: model name supported by your provider.
-- `A2A_BEARER_TOKEN`: token accepted by this deployment. For multi-principal tests, different bearer tokens are treated as different principals.
-- `DATABASE_URL`: SQLAlchemy database URL.
-- `PUBLIC_BASE_URL`: public origin/base URL used in Agent Card; set to your HTTPS Render URL.
-- `APP_VERSION`: version string.
-- `AI_TIMEOUT_SECONDS`: AI call timeout.
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Health check path: `/health`
+- `PUBLIC_BASE_URL`: set to the public origin only, e.g. `https://your-service.onrender.com`. The Agent Card advertises `https://your-service.onrender.com/a2a/`.
+- Set `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`, and `A2A_BEARER_TOKEN` in Render's Environment page. Never commit keys to GitHub.
+- Use persistent storage. SQLite on Render's ephemeral filesystem can lose task and idempotency data after restarts/deploys. For SQLite, attach a persistent disk and use a database path on that disk; otherwise use a persistent managed SQL database.
 
-If using a provider with a non-OpenAI-compatible API, adapt `app/services/ai_service.py` to its request format.
+## Routes
 
-## 3. Render deployment
+| Method | Path | Access | Success response |
+|---|---|---|---|
+| GET | `/.well-known/agent-card.json` | Public | Agent Card JSON |
+| GET | `/health` | Public | `{"status":"ok"}` |
+| POST | `/a2a/message:send` | Bearer + A2A version + A2A media type | `{"task": Task}` |
+| GET | `/a2a/tasks` | Bearer + A2A version | `{"tasks": [Task, ...]}` for caller only |
+| GET | `/a2a/tasks/{task_id}` | Bearer + A2A version; owner only | Task |
+| POST | `/a2a/tasks/{task_id}:cancel` | Bearer + A2A version + A2A media type; owner only | Task |
 
-1. Push this project to a GitHub repository. Do not push `.env`.
-2. In Render, create a Web Service and connect the repository.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-5. Set `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`, `A2A_BEARER_TOKEN`, `DATABASE_URL`, and `PUBLIC_BASE_URL` in Render Environment.
-6. Use a persistent database. SQLite on an ephemeral filesystem can lose data on redeploy/restart. If using a Render persistent disk with SQLite, mount it and point `DATABASE_URL` to that disk path; otherwise use a managed SQL database supported by your assignment.
-7. Confirm the public Agent Card and API behavior over HTTPS.
+Protected routes require `Authorization: Bearer <token>` and `A2A-Version: 1.0`. POST routes require `Content-Type: application/a2a+json`. Each distinct bearer token maps to a separate principal for isolation checks.
 
-## 4. A2A endpoints
+## Message contract
 
-- `GET /.well-known/agent-card.json` — public
-- `POST /a2a/message:send` — authenticated
-- `GET /a2a/tasks` — authenticated, lists only the current principal's tasks
-- `GET /a2a/tasks/{task_id}` — authenticated and owner-only
-- `POST /a2a/tasks/{task_id}:cancel` — authenticated and owner-only
+An initial `message` must contain a `messageId`, `role: ROLE_USER`, and a Part with media type `application/vnd.ga5.invoice-claim-batch+json`. Its data contains `batchId`, `policyRevision`, and `packages`. The response includes a `TASK_STATE_INPUT_REQUIRED` Task and one proposal artifact using `application/vnd.ga5.invoice-action-proposals+json`.
 
-All authenticated routes require:
-- `Authorization: Bearer <token>`
-- `A2A-Version: 1.0`
-- `Content-Type: application/a2a+json` for POSTs
+A continuation uses a new `messageId`, exact `taskId` and `contextId`, `role: ROLE_USER`, and media type `application/vnd.ga5.invoice-action-results+json`. Its batch and each package/action identity must match the stored proposal. Only `ACCEPTED` results become receipt executions. The receipt artifact uses `application/vnd.ga5.invoice-action-receipts+json`; rejected results are retained in history but do not execute.
 
-## 5. Request/continuation outline
+Equivalent requests deduplicate by principal + `messageId` and canonical hash of `message` only; `configuration` is ignored. Reusing a message ID with different message content returns HTTP 409 `IDEMPOTENCY_CONFLICT`. Task completion and cancellation use conditional database state transitions so only one can win.
 
-Initial request message data should use media type:
-`application/vnd.ga5.invoice-claim-batch+json`
+## AI decision cache
 
-The initial message data is expected to contain `batchId`, `policyRevision`, and `packages`. A valid result continuation uses `batchId` and `results`, where each result includes `packageId`, `actionId`, `action`, `outcome`, and `receiptNonce`.
+Decision cache keys use canonical package content plus `policyRevision`, excluding namespace-only package IDs. A new batch/message/task can therefore reuse stable package decisions while fresh evidence creates a new cache key. The AI is prompted to choose one permitted action, copy three decisive evidence references, provide facts, and cite evidence in the rationale. Output is validated before proposals are persisted.
 
-The implementation accepts both direct message objects and common A2A-like message wrappers. Always compare the payload with your assignment's exact example request when integrating with the evaluator.
-
-## 6. Tests
+## Tests
 
 ```bash
 pytest -q
 ```
 
-Tests use isolated in-memory SQLite and do not need an AI API key.
-
-## 7. Security notes
-
-- Never commit credentials.
-- Demo mode is for local smoke testing only.
-- The app validates AI output before creating proposals.
-- AI output is not permission to execute a financial action. Only accepted result continuations produce receipts.
+Tests mock the AI provider and do not require a live API key. Before grading, configure a valid key, deploy, inspect the public Agent Card, and test a full proposal → results continuation → receipt lifecycle.
