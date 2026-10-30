@@ -139,7 +139,7 @@ def run_batch_ai(packages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 
     try:
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-3-flash-preview",
             generation_config={"response_mime_type": "application/json"},
         )
         payload = [p for _, p in uncached]
